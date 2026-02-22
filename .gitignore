@@ -1,0 +1,15 @@
+# Logs
+whisper-error.log
+whisper-history.log
+
+# Preview
+mic-icon-preview.png
+nul
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
