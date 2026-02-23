@@ -12,7 +12,8 @@
 | `whisper-dictate.bat` | Starter fuer whisper-dictate (ruft `pythonw` auf, pfadunabhaengig via `%~dp0`) |
 | `whisper-restart.bat` | Beendet laufende Instanz und startet neu (kill + wait + start) |
 | `whisper-transcribe.py` | Audiodatei zu Text (CLI-Tool, kein Hotkey) |
-| `setup.bat` | Einrichtung fuer neue PCs: Pakete, Autostart, Modell-Download |
+| `install.bat` | Einrichtung fuer neue PCs: Pakete, Autostart, Modell-Download |
+| `whisper-config.json` | Persistente Einstellungen (calm_mode etc.), wird automatisch erstellt |
 | `whisper-error.log` | Wird bei CUDA/Modell-Fehlern erstellt (nur wenn Fehler auftritt) |
 | `whisper-history.log` | Transkriptions-Log: jede Diktierung mit Timestamp (append, UTF-8) |
 
@@ -37,7 +38,7 @@
 - **Ausgabe:** Transkribierter Text wird via Clipboard in das aktive Fenster eingefuegt
 - **Tray-Icon Farben:** Grau = Modell laedt, Gruen = bereit, Rot = Aufnahme laeuft
 - **Audio-Feedback:** Hoher Beep (800 Hz) bei Start, tiefer Beep (500 Hz) bei Stop (`winsound.Beep`)
-- **REC-Overlay:** Roter pulsierender Balken (8px) am oberen Bildschirmrand auf allen Monitoren waehrend der Aufnahme (tkinter, click-through). Mikrofon-Icon (100x100, 8x Supersampling fuer glatte Raender, Rand gegen Dunkelrot composited statt Schwarz)
+- **REC-Overlay:** Roter pulsierender Balken (8px) am oberen Bildschirmrand auf allen Monitoren waehrend der Aufnahme (tkinter, click-through). Mikrofon-Icon (100x100, 8x Supersampling, r_outer=400 fuer lueckenlosen Kreis) mit Electric Border Effect: 90 pre-gerenderte Frames (3s Loop, 30fps) mit echtem 2D Pixel-Displacement (simuliert SVG feDisplacementMap). Dual-Ring-System: innerer Ring (White-hot Core + Sharp + 4 Glow-Layer, border_r=mic_r+1) und aeusserer Orbit-Ring (eigenes Noise-Feld, langsamerer Pan). Fill-Disc (200,42,42, Blur 8) hinter allen Rings fuellt den Bereich zwischen Mic-Icon und Electric Border lueckenlos. Noise-Texturen (5 Oktaven, 520x520) werden zirkulaer gepannt fuer organische Turbulenz. Alle Blur-Layer werden VOR dem Frame-Loop zu 2 Composite-Bildern zusammengefuegt (nur 2 Displacement-Ops pro Frame statt 6, keine Blur-Ops im Loop). Visuelle Effekte: Breathing Pulse (Glow-Intensitaet pulsiert per Sinus), Core-Flash (3 kurze Helligkeits-Blitze pro Loop), Dunkelrot-Compositing (halbtransparente Randpixel → dunkles Rot statt Schwarz). Pre-Rendering laeuft parallel zum Modell-Laden (~5-8s). Fallback: statisches Mic-Icon mit Fill-Disc bis Frames fertig. ~7 MB RAM fuer Frame-Liste
 - **History Log:** Jede erfolgreiche Transkription wird mit Timestamp in `whisper-history.log` gespeichert (`[2026-02-17 14:32:05] Text...`)
 
 ### Konfiguration (oben im Script)
@@ -47,20 +48,21 @@
 | `MODEL_SIZE` | Whisper-Modell (aktuell `large-v3`) |
 | `INITIAL_PROMPT` | Fachbegriffe fuer bessere Erkennung (Komma-getrennt) |
 | `SPOKEN_PUNCTUATION` | Gesprochene Satzzeichen → echte Zeichen (Regex-Dict) |
-| `NO_SPEECH_THRESHOLD` | Schwellwert fuer Stille-Erkennung (0.7, erhoeht von 0.6 wegen Dialekt-Filterung) |
+| `NO_SPEECH_THRESHOLD` | Deaktiviert (`None`). Whisper's `no_speech_prob` ist bei Deutsch unzuverlaessig (markiert klare Sprache mit 0.97). `vad_filter=True` uebernimmt die Stille-Erkennung |
 | `DEBUG_TRANSCRIPTION` | Segment-Details ins History-Log schreiben (True/False) |
 | `SHORT_TEXT_MAX_WORDS` | Bei <= N Woertern trailing Punkt entfernen (3) |
 | `HALLUCINATION_PHRASES` | Bekannte Whisper-Halluzinationen die gefiltert werden |
 
 ### Tray-Menue
-- **Neustart:** Beendet aktuelle Instanz, wartet 2s (Mutex-Freigabe), startet neu via `whisper-dictate.bat`. Detached `cmd.exe` ueberlebt den Prozess-Tod
+- **Calm:** Toggle fuer Calm Mode (Haekchen = aktiv). Ersetzt das animierte Electric Border Overlay durch ein statisches Mic-Icon (weisses Mikrofon in rotem Kreis). Einstellung wird persistent in `whisper-config.json` gespeichert, wirkt sofort ohne Neustart
+- **Neustart:** Beendet aktuelle Instanz, wartet 2s (Mutex-Freigabe), startet `pythonw` direkt neu. Verwendet `pythonw -c "import time,subprocess;time.sleep(2);..."` statt `cmd.exe` fuer komplett unsichtbaren Neustart (kein Terminal-Fenster)
 - **Beenden:** Beendet das Diktiertool komplett
 
 ### Debug-Logging
 Bei `DEBUG_TRANSCRIPTION = True` wird jedes Whisper-Segment mit Status ins History-Log geschrieben:
-- `KEEP (no_speech=0.12): Text` = Segment wurde uebernommen
-- `SKIP (no_speech=0.85): Text` = Segment wegen hoher Stille-Wahrscheinlichkeit verworfen
+- `KEEP (no_speech=0.12): Text` = Segment wurde uebernommen (no_speech-Wert nur informativ)
 - `SKIP (hallucination): Text` = Bekannte Halluzination gefiltert
+- Hinweis: `no_speech_prob` wird nur geloggt, nicht zum Filtern verwendet (bei Deutsch unzuverlaessig)
 
 ### Trailing Period
 Bei kurzen Diktaten (1-3 Woerter) entfernt `remove_trailing_period()` den automatisch von Whisper hinzugefuegten Punkt. Konfigurierbar ueber `SHORT_TEXT_MAX_WORDS`.
@@ -71,12 +73,14 @@ Automatische Eintraege im History-Log:
 - `[PERF] 12.3s Audio → 8.1s Transkription (1.5x Echtzeit)` = Transkriptions-Performance pro Diktat
 
 ### Autostart
-Startet automatisch beim Windows-Login via Verknuepfung im Startup-Ordner:
+Startet automatisch beim Windows-Login via Registry Run-Key:
 ```
-%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\Whisper Diktiertool.lnk
+HKCU\Software\Microsoft\Windows\CurrentVersion\Run\WhisperDiktiertool
 ```
-- **Ziel:** `whisper-dictate.bat`
-- **WindowStyle 7** (minimiert, kein sichtbares CMD-Fenster)
+- **Wert:** `"C:\...\pythonw.exe" "C:\...\whisper-dictate.py"` (Pfade dynamisch)
+- **Kein PowerShell/COM noetig:** Verwendet `winreg` (Python stdlib)
+- **Self-Provisioning:** `ensure_autostart()` prueft beim Start ob der Registry-Eintrag korrekt ist und setzt ihn falls nicht (unabhaengig von install.bat)
+- **Cleanup:** Alte `.lnk` aus Startup-Ordner und `StartupApproved`-Geistereintrag werden automatisch entfernt
 
 ### Manuell starten
 ```
@@ -102,6 +106,7 @@ Windows Mutex (`WhisperDiktiertool_Mutex`) verhindert Doppelstart. Wenn eine Ins
 - **Thread 1:** `hotkey_loop` - wartet auf `keyboard.wait(HOTKEY)`, startet erst wenn Modell geladen
 - **Thread 2:** `load_model` - laedt Whisper-Modell auf GPU
 - **Thread 3:** `RecordingOverlay` - tkinter Fenster, pollt `recording`-Status alle 100ms
+- **Thread 4:** `_prerender_frames` - rendert 90 Electric Border Frames beim Start (parallel zu Thread 2+3)
 
 ### CUDA DLL-Pfade
 Das Script setzt NVIDIA DLL-Pfade manuell fuer cublas und cudnn:
@@ -145,7 +150,9 @@ Python312/Lib/site-packages/nvidia/cudnn/bin
 - `pythonw` hat keine Konsole - Fehler sind unsichtbar. Fehler beim Modell-Laden werden in `whisper-error.log` geschrieben
 - Der `hotkey_loop` Thread wartet endlos auf `model is not None`. Wenn das Modell nicht laden kann, reagiert der Hotkey nie
 - Die `keyboard`-Bibliothek braucht ggf. Admin-Rechte fuer globale Hotkeys (abhaengig von Windows-Version/Einstellungen)
-- RAM-Verbrauch von ~220 MB ist normal - das Modell liegt im GPU VRAM, nicht im System-RAM
+- RAM-Verbrauch von ~228 MB ist normal (~220 MB Basis + ~7 MB Electric Border Frames). Das Modell liegt im GPU VRAM, nicht im System-RAM
+- Whisper's `no_speech_prob` ist bei Deutsch unzuverlaessig: klar gesprochene Saetze werden mit 0.97 markiert. Daher ist die Filterung deaktiviert (`NO_SPEECH_THRESHOLD = None`). `vad_filter=True` uebernimmt die Stille-Erkennung auf Audio-Ebene
+- Whisper kann Zahlenformate inkonsistent transkribieren (z.B. "140" als "140.000" im Deutschen Tausenderformat). Dies ist eine Modell-Limitation
 
 ---
 
@@ -161,6 +168,17 @@ Python312/Lib/site-packages/nvidia/cudnn/bin
 | Mikrofon-Icon 8x Supersampling (statt 4x) | Glattere Raender trotz tkinter 1-Bit-Transparenz |
 | Rand gegen Dunkelrot composited (statt Schwarz) | Halbtransparente Randpixel werden zu dunklem Rot statt fast-Schwarz |
 | Segment-Generator zu Liste (`list(segments)`) | Verhindert Datenverlust bei Iteration-Fehlern |
+| Electric Border pre-gerendert (90 Frames) | 0 Rendering-Kosten zur Laufzeit, nur Frame-Index wechseln (<1ms) |
+| 2D Pixel-Displacement statt Polyline-Noise | Echtes feDisplacementMap-Ergebnis statt "Wurm"-Effekt |
+| Audio-Level Tracking (`audio_level` global) | RMS-Pegel in `audio_callback` berechnet (0.0-1.0), aktuell nicht visuell genutzt |
+| Pre-Composite aller Blur-Layer vor Frame-Loop | 2 Displacement-Ops pro Frame statt 6, 0 Blur-Ops im Loop (42s → ~5-8s) |
+| Dual-Ring-System (Inner + Outer Orbit) | Aeusserer Ring mit eigenem Noise-Feld, langsamerer Pan, gibt Tiefe |
+| White-hot Core + Breathing Pulse + Core-Flash | Plasma-Kern (fast weiss), Glow pulsiert per Sinus, 3 Helligkeits-Blitze pro Loop |
+| Dunkelrot-Compositing fuer Electric Border | Halbtransparente Glow-Randpixel → dunkles Rot statt fast-Schwarz |
+| Neustart ohne CMD-Fenster | `pythonw -c` statt `cmd.exe /c timeout` fuer komplett unsichtbaren Neustart |
+| Fill-Disc hinter Electric Rings | Gefuellter roter Kreis (200,42,42, Blur 8) fuellt Gap zwischen Mic und Ring |
+| Mic-Icon r_outer 384→400, border_r +6→+1 | Roter Kreis fuellt Icon komplett, Ring sitzt direkt am Rand |
+| no_speech_prob Filterung deaktiviert | Keine verlorenen Segmente mehr (Whisper markierte klare Sprache mit 0.97) |
 
 ### Gemessene Performance (22.02.2026)
 
@@ -171,6 +189,7 @@ Python312/Lib/site-packages/nvidia/cudnn/bin
 | Kurze Diktate (1-3 Woerter) | 2-4s | 0.5-0.6s | 4-6x |
 | Mittlere Diktate (1-2 Saetze) | 4-10s | 0.7-1.2s | 5-10x |
 | Langes Diktat (6 Saetze) | 54.6s | 5.0s | 11x |
+| Sehr langes Diktat (20 Segmente) | 72.8s | 7.7s | 9.5x |
 
 ---
 
@@ -195,10 +214,10 @@ pip install faster-whisper sounddevice keyboard pyperclip pystray Pillow
 CUDA/cuDNN werden mit `faster-whisper` automatisch installiert.
 
 ### Installation (neuer PC)
-Ordner kopieren und `setup.bat` ausfuehren. Das Script:
+Ordner kopieren und `install.bat` ausfuehren. Das Script:
 1. Prueft Python, pip und NVIDIA GPU
 2. Installiert alle pip-Pakete
-3. Erstellt Autostart-Verknuepfung im Startup-Ordner
+3. Erstellt Autostart via Registry Run-Key (HKCU)
 4. Laedt das Whisper-Modell herunter (~3 GB fuer large-v3, erster Start)
 5. Startet das Diktiertool
 

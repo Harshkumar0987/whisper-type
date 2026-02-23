@@ -61,24 +61,33 @@ if errorlevel 1 (
 )
 
 echo.
-echo [3/5] Erstelle Autostart-Verknuepfung...
+echo [3/5] Erstelle Autostart (Registry Run-Key)...
 echo.
 
-:: Startup-Verknuepfung via PowerShell erstellen
-set "STARTUP=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup"
+:: pythonw.exe Pfad dynamisch ermitteln
+for /f "delims=" %%p in ('python -c "import sys,os;print(os.path.join(os.path.dirname(sys.executable),'pythonw.exe'))"') do set "PYTHONW=%%p"
 set "SCRIPT_DIR=%~dp0"
 :: Trailing backslash entfernen
 if "%SCRIPT_DIR:~-1%"=="\" set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-    "$ws = New-Object -ComObject WScript.Shell; $lnk = $ws.CreateShortcut('%STARTUP%\Whisper Diktiertool.lnk'); $lnk.TargetPath = '%SCRIPT_DIR%\whisper-dictate.bat'; $lnk.WorkingDirectory = '%SCRIPT_DIR%'; $lnk.WindowStyle = 7; $lnk.Description = 'Whisper Diktiertool - Sprache zu Text (CTRL+ALT+D)'; $lnk.Save()"
+:: Registry Run-Key setzen (HKCU, kein Admin noetig)
+reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v WhisperDiktiertool /t REG_SZ /d "\"%PYTHONW%\" \"%SCRIPT_DIR%\whisper-dictate.py\"" /f >nul 2>&1
 
-if exist "%STARTUP%\Whisper Diktiertool.lnk" (
-    echo   Autostart-Verknuepfung erstellt
+if not errorlevel 1 (
+    echo   Autostart-Eintrag erstellt (Registry Run-Key)
 ) else (
-    echo   [WARNUNG] Verknuepfung konnte nicht erstellt werden.
+    echo   [WARNUNG] Registry-Eintrag konnte nicht erstellt werden.
     echo             Manuell: whisper-dictate.bat in shell:startup kopieren.
 )
+
+:: Alte .lnk aus Startup-Ordner aufraeumen (falls vorhanden)
+set "OLD_LNK=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\Whisper Diktiertool.lnk"
+if exist "%OLD_LNK%" (
+    del "%OLD_LNK%" >nul 2>&1
+    echo   Alte Startup-Verknuepfung entfernt
+)
+:: StartupApproved-Geistereintrag entfernen
+reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder" /v "Whisper Diktiertool.lnk" /f >nul 2>&1
 
 echo.
 echo [4/5] Lade Whisper-Modell herunter (large-v3, ca. 3 GB)...

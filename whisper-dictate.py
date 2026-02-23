@@ -36,6 +36,7 @@ if _dll_dirs:
 import time
 import math
 import re
+import json
 import threading
 import numpy as np
 import sounddevice as sd
@@ -43,7 +44,7 @@ import keyboard
 import pyperclip
 import subprocess
 import pystray
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 import winsound
 
 # ============================================================
@@ -52,7 +53,7 @@ import winsound
 HOTKEY = "ctrl+alt+d"
 SAMPLE_RATE = 16000      # Whisper erwartet 16kHz
 MODEL_SIZE = "large-v3"  # Beste Qualitaet, auch mit Hintergrundmusik
-NO_SPEECH_THRESHOLD = 0.7  # Segmente mit hoeherem no_speech_prob werden verworfen
+NO_SPEECH_THRESHOLD = None  # Deaktiviert (no_speech_prob ist bei Deutsch unzuverlaessig)
 DEBUG_TRANSCRIPTION = True   # Segment-Details ins History-Log schreiben
 SHORT_TEXT_MAX_WORDS = 3     # Bei <= N Woertern: trailing Punkt entfernen
 
@@ -102,10 +103,12 @@ user32 = ctypes.windll.user32
 recording = False
 audio_chunks = []
 audio_overflow_count = 0
+audio_level = 0.0  # RMS-Pegel 0.0-1.0, wird in audio_callback aktualisiert
 model = None
 stream = None
 target_window = None
 tray_icon = None
+calm_mode = False  # True = statisches Mic-Icon statt Electric Border
 
 
 def create_icon_idle():
@@ -156,8 +159,9 @@ def filter_hallucinations(segments):
     for seg in segments:
         text = seg.text.strip()
         no_speech = getattr(seg, "no_speech_prob", 0.0)
-        # Segmente mit hoher no_speech-Wahrscheinlichkeit verwerfen
-        if no_speech > NO_SPEECH_THRESHOLD:
+        # no_speech_prob Filterung deaktiviert: Whisper gibt bei Deutsch oft 0.97
+        # fuer klar gesprochene Saetze aus. vad_filter=True macht bereits Audio-VAD.
+        if NO_SPEECH_THRESHOLD is not None and no_speech > NO_SPEECH_THRESHOLD:
             if DEBUG_TRANSCRIPTION:
                 debug_lines.append(f"  SKIP (no_speech={no_speech:.2f}): {text}")
             continue
@@ -206,6 +210,81 @@ def append_to_history(text, duration=0):
         pass
 
 
+def load_config():
+    """Config aus whisper-config.json laden. Gibt Defaults zurueck falls nicht vorhanden."""
+    global calm_mode
+    config_path = os.path.join(os.path.dirname(__file__), "whisper-config.json")
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+        calm_mode = config.get("calm_mode", False)
+    except Exception:
+        pass
+
+
+def save_config():
+    """Aktuelle Config in whisper-config.json speichern."""
+    config_path = os.path.join(os.path.dirname(__file__), "whisper-config.json")
+    try:
+        config = {"calm_mode": calm_mode}
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(config, f)
+    except Exception:
+        pass
+
+
+def ensure_autostart():
+    """Registry Run-Key erstellen/aktualisieren + alte .lnk aufraeumen."""
+    import winreg
+    try:
+        # Pfade dynamisch ermitteln
+        pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+        script = os.path.abspath(__file__)
+        expected_value = f'"{pythonw}" "{script}"'
+
+        # Registry Run-Key pruefen und ggf. setzen
+        reg_key = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        reg_name = "WhisperDiktiertool"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_key, 0,
+                            winreg.KEY_READ | winreg.KEY_WRITE) as key:
+            try:
+                current_value, _ = winreg.QueryValueEx(key, reg_name)
+                if current_value == expected_value:
+                    # Bereits korrekt, nur Cleanup pruefen
+                    _cleanup_old_autostart()
+                    return
+            except FileNotFoundError:
+                pass  # Eintrag existiert noch nicht
+            winreg.SetValueEx(key, reg_name, 0, winreg.REG_SZ, expected_value)
+
+        # Alte .lnk und StartupApproved aufraeumen
+        _cleanup_old_autostart()
+    except Exception:
+        pass
+
+
+def _cleanup_old_autostart():
+    """Alte Startup-Verknuepfung und StartupApproved-Geistereintrag entfernen."""
+    import winreg
+    # Alte .lnk loeschen
+    try:
+        startup_dir = os.path.join(os.environ["APPDATA"],
+                                   "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
+        lnk_path = os.path.join(startup_dir, "Whisper Diktiertool.lnk")
+        if os.path.exists(lnk_path):
+            os.remove(lnk_path)
+    except Exception:
+        pass
+    # StartupApproved-Geistereintrag entfernen (verhindert toten Eintrag im Task Manager)
+    try:
+        approved_key = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, approved_key, 0,
+                            winreg.KEY_SET_VALUE) as key:
+            winreg.DeleteValue(key, "Whisper Diktiertool.lnk")
+    except Exception:
+        pass
+
+
 def get_monitors():
     """Alle angeschlossenen Monitore ermitteln (Position und Groesse)."""
     monitors = []
@@ -228,29 +307,41 @@ def get_monitors():
 
 
 class RecordingOverlay:
-    """Roter Balken am oberen Bildschirmrand auf allen Monitoren waehrend der Aufnahme."""
+    """Mikrofon-Icon mit Electric Border Effect (pre-gerendert) + roter Balken."""
 
     BAR_HEIGHT = 8
-    MIC_SIZE = 100
+    DISPLAY_SIZE = 160   # Fenster-Groesse (Mic 100px + Platz fuer Electric Border + Glow)
+    RENDER_SIZE = 320    # 2x Supersampling
+    MIC_DISPLAY = 100    # Mic-Icon Anzeige-Groesse
+    TRANS_COLOR = (1, 1, 1)  # RGB fuer Transparenz
+    NUM_FRAMES = 90      # 3s Animation-Loop bei 30fps
 
     def __init__(self):
         self.root = None
         self._windows = []
-        self._mic_win = None
-        self._mic_photo = None
+        self._orb_win = None
+        self._orb_label = None
+        self._orb_photo = None
+        self._mic_rgba = None       # Vorgerendertes Mic-Icon (RGBA, Render-Groesse)
+        self._frames = None         # Liste von pre-gerenderten RGB Frames
+        self._frames_ready = False  # True wenn Pre-Rendering abgeschlossen
+        self._static_frame = None   # Fallback-Frame (nur Mic, keine Electric Border)
         self._visible = False
+        self._t0 = 0
 
-    def _create_mic_image(self):
-        """Premium Mikrofon-Icon (100x100), 8x Supersampling fuer glatte Raender."""
-        s = self.MIC_SIZE
-        scale = 8
-        hs = s * scale
+    def _create_mic_icon(self):
+        """Original Mikrofon-Icon als RGBA, 8x Supersampling fuer glatte Raender.
+
+        Rendert bei 800x800 und skaliert auf Render-Groesse (200x200).
+        Identisches Design wie das bisherige Icon (roter Gradient-Kreis, weisses Mic).
+        """
+        hs = 800
         img = Image.new("RGBA", (hs, hs), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
-        cx = hs // 2
+        cx = 400
 
         # --- Kreis: Smooth Gradient (viele Stufen) ---
-        r_outer = 384
+        r_outer = 400  # Volle Groesse, fuellt Icon-Bounding-Box komplett
         steps = 40
         for i in range(steps):
             t = i / (steps - 1)
@@ -274,40 +365,251 @@ class RecordingOverlay:
 
         # Schatten
         sh = Image.new("RGBA", (hs, hs), (0, 0, 0, 0))
-        sd = ImageDraw.Draw(sh)
+        shd = ImageDraw.Draw(sh)
         o = 10
         sc = (120, 25, 25, 100)
-        sd.rounded_rectangle([cx - 76 + o, 176 + o, cx + 76 + o, 432 + o],
-                             radius=76, fill=sc)
-        sd.arc([cx - 136 + o, 352 + o, cx + 136 + o, 544 + o],
-               0, 180, fill=sc, width=24)
-        sd.line([cx + o, 544 + o, cx + o, 600 + o], fill=sc, width=24)
-        sd.rounded_rectangle([cx - 68 + o, 588 + o, cx + 68 + o, 616 + o],
-                             radius=14, fill=sc)
+        shd.rounded_rectangle([cx-76+o, 176+o, cx+76+o, 432+o], radius=76, fill=sc)
+        shd.arc([cx-136+o, 352+o, cx+136+o, 544+o], 0, 180, fill=sc, width=24)
+        shd.line([cx+o, 544+o, cx+o, 600+o], fill=sc, width=24)
+        shd.rounded_rectangle([cx-68+o, 588+o, cx+68+o, 616+o], radius=14, fill=sc)
         img = Image.alpha_composite(img, sh)
         draw = ImageDraw.Draw(img)
 
         # Kapsel
-        draw.rounded_rectangle([cx - 76, 176, cx + 76, 432], radius=76, fill=w)
+        draw.rounded_rectangle([cx-76, 176, cx+76, 432], radius=76, fill=w)
         # U-Halterung
-        draw.arc([cx - 136, 352, cx + 136, 544], 0, 180, fill=w, width=24)
+        draw.arc([cx-136, 352, cx+136, 544], 0, 180, fill=w, width=24)
         # Stiel
         draw.line([cx, 544, cx, 600], fill=w, width=24)
         # Basis
-        draw.rounded_rectangle([cx - 68, 588, cx + 68, 616], radius=14, fill=w)
+        draw.rounded_rectangle([cx-68, 588, cx+68, 616], radius=14, fill=w)
 
-        # --- Runterskalieren ---
-        img = img.resize((s, s), Image.LANCZOS)
-        # Gegen Kreisrand-Farbe (Dunkelrot) compositen statt gegen Schwarz.
-        # Halbtransparente Rand-Pixel werden zu dunklem Rot statt fast-Schwarz,
-        # ergibt glatten Anti-Aliased Rand trotz tkinters 1-Bit-Transparenz.
-        bg = Image.new("RGBA", (s, s), (180, 40, 40, 255))
-        composited = Image.alpha_composite(bg, img)
+        # Resize auf Render-Groesse (200x200 bei 320x320 Frame)
+        target = int(self.MIC_DISPLAY * self.RENDER_SIZE / self.DISPLAY_SIZE)
+        return img.resize((target, target), Image.LANCZOS)
+
+    def _generate_noise_texture(self, size, seed):
+        """Multi-Oktaven Rausch-Textur (size x size) fuer Pixel-Displacement.
+
+        Erzeugt smooth, turbulenz-aehnliches Noise-Feld mit 5 Oktaven.
+        Verwendet nur numpy + PIL (keine externen Noise-Libraries).
+        """
+        rng = np.random.default_rng(seed)
+        result = np.zeros((size, size), dtype=np.float32)
+        for octave in range(5):
+            grid_size = 4 * (2 ** octave)  # 4, 8, 16, 32, 64
+            if grid_size >= size:
+                break
+            amp = 1.0 / (1 + octave * 0.7)
+            grid = rng.uniform(-1, 1, (grid_size, grid_size)).astype(np.float32)
+            grid_img = Image.fromarray(((grid + 1) * 127.5).astype(np.uint8), mode='L')
+            smooth = np.array(grid_img.resize((size, size), Image.BICUBIC)).astype(np.float32)
+            result += amp * (smooth / 127.5 - 1.0)
+        max_val = np.abs(result).max()
+        if max_val > 0:
+            result /= max_val
+        return result
+
+    def _apply_displacement(self, img_arr, dx, dy):
+        """2D Pixel-Displacement mit bilinearer Interpolation (pure numpy).
+
+        Verschiebt jeden Pixel des Bildes unabhaengig basierend auf dx/dy Feldern.
+        Dies simuliert SVG feDisplacementMap: der Ring wird pro Pixel verzerrt,
+        nicht als Ganzes verschoben (wie bei der Polyline-Methode).
+        """
+        h, w = img_arr.shape[:2]
+        ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
+
+        src_x = np.clip(xs + dx, 0, w - 1)
+        src_y = np.clip(ys + dy, 0, h - 1)
+
+        x0 = np.floor(src_x).astype(int)
+        y0 = np.floor(src_y).astype(int)
+        x1 = np.minimum(x0 + 1, w - 1)
+        y1 = np.minimum(y0 + 1, h - 1)
+
+        fx = (src_x - x0)[:, :, np.newaxis]
+        fy = (src_y - y0)[:, :, np.newaxis]
+
+        result = (
+            img_arr[y0, x0] * (1 - fx) * (1 - fy) +
+            img_arr[y1, x0] * (1 - fx) * fy +
+            img_arr[y0, x1] * fx * (1 - fy) +
+            img_arr[y1, x1] * fx * fy
+        )
+        return np.clip(result, 0, 255).astype(np.uint8)
+
+    def _make_display_frame(self, frame_rgba):
+        """RGBA Frame (RENDER_SIZE) zu RGB (DISPLAY_SIZE) mit Transparenz konvertieren.
+
+        Composited gegen Dunkelrot statt Schwarz/(1,1,1), damit halbtransparente
+        Glow-Randpixel als dunkles Rot erscheinen statt als fast-Schwarz.
+        """
+        img = frame_rgba.resize((self.DISPLAY_SIZE, self.DISPLAY_SIZE), Image.LANCZOS)
+        tc = self.TRANS_COLOR
+        # Gegen Dunkelrot compositen (halbtransparente Pixel → dunkles Rot statt Schwarz)
+        comp_bg = Image.new("RGBA", (self.DISPLAY_SIZE, self.DISPLAY_SIZE), (80, 15, 15, 255))
+        composited = Image.alpha_composite(comp_bg, img)
         alpha = img.split()[3]
-        mask = alpha.point(lambda x: 255 if x > 10 else 0)
-        rgb = Image.new("RGB", (s, s), (1, 1, 1))
+        mask = alpha.point(lambda x: 255 if x > 6 else 0)
+        rgb = Image.new("RGB", (self.DISPLAY_SIZE, self.DISPLAY_SIZE), tc)
         rgb.paste(composited.convert("RGB"), mask=mask)
         return rgb
+
+    def _prerender_frames(self):
+        """Electric Border Frames vorrendern (optimiert).
+
+        Alle Blur-Layer werden VOR dem Loop zu 2 Composite-Bildern zusammengefuegt.
+        Pro Frame nur 2 Displacement-Ops (statt 6) und 0 Blur-Ops (statt 6+).
+        """
+        t0 = time.time()
+        rs = self.RENDER_SIZE  # 320
+        cx = rs // 2  # 160
+
+        mic_r = int(self.MIC_DISPLAY / 2 * rs / self.DISPLAY_SIZE)
+        border_r = mic_r + 1   # Ring sitzt direkt am Mic-Rand (fast kein Gap)
+        outer_r = border_r + 18
+
+        # --- Fill-Disc: Roter Hintergrund bis unter alle Rings ---
+        # Deckt den gesamten Bereich hinter den Rings ab, auch bei max. Displacement.
+        # Farbe passend zum Mic-Aussen-Gradient (205, 45, 45).
+        fill_disc = Image.new("RGBA", (rs, rs), (0, 0, 0, 0))
+        fill_r = outer_r + 20  # Grosszuegig bis weit unter den Outer Ring
+        ImageDraw.Draw(fill_disc).ellipse(
+            [cx - fill_r, cx - fill_r, cx + fill_r, cx + fill_r],
+            fill=(200, 42, 42, 255))
+        fill_disc = fill_disc.filter(ImageFilter.GaussianBlur(radius=8))
+
+        # --- Ring-Layer zeichnen ---
+        ring_core = Image.new("RGBA", (rs, rs), (0, 0, 0, 0))
+        ImageDraw.Draw(ring_core).ellipse(
+            [cx - border_r, cx - border_r, cx + border_r, cx + border_r],
+            outline=(255, 235, 220, 245), width=3)
+
+        ring_sharp = Image.new("RGBA", (rs, rs), (0, 0, 0, 0))
+        ImageDraw.Draw(ring_sharp).ellipse(
+            [cx - border_r, cx - border_r, cx + border_r, cx + border_r],
+            outline=(255, 120, 80, 220), width=5)
+
+        ring_glow = Image.new("RGBA", (rs, rs), (0, 0, 0, 0))
+        ImageDraw.Draw(ring_glow).ellipse(
+            [cx - border_r, cx - border_r, cx + border_r, cx + border_r],
+            outline=(239, 68, 68, 200), width=14)
+
+        ring_ambient = Image.new("RGBA", (rs, rs), (0, 0, 0, 0))
+        ImageDraw.Draw(ring_ambient).ellipse(
+            [cx - border_r, cx - border_r, cx + border_r, cx + border_r],
+            outline=(239, 50, 50, 160), width=22)
+
+        ring_outer = Image.new("RGBA", (rs, rs), (0, 0, 0, 0))
+        ImageDraw.Draw(ring_outer).ellipse(
+            [cx - outer_r, cx - outer_r, cx + outer_r, cx + outer_r],
+            outline=(255, 100, 80, 140), width=2)
+
+        ring_outer_glow = Image.new("RGBA", (rs, rs), (0, 0, 0, 0))
+        ImageDraw.Draw(ring_outer_glow).ellipse(
+            [cx - outer_r, cx - outer_r, cx + outer_r, cx + outer_r],
+            outline=(239, 60, 60, 120), width=8)
+
+        # --- Pre-Composite: Alle Layer VOR dem Loop zusammenfuegen + blurren ---
+        # Inner Composite (6 Layer → 1 Bild, nur 1 Displacement pro Frame)
+        inner = Image.new("RGBA", (rs, rs), (0, 0, 0, 0))
+        inner = Image.alpha_composite(inner, ring_ambient.filter(ImageFilter.GaussianBlur(radius=20)))
+        inner = Image.alpha_composite(inner, ring_glow.filter(ImageFilter.GaussianBlur(radius=10)))
+        inner = Image.alpha_composite(inner, ring_glow.filter(ImageFilter.GaussianBlur(radius=4)))
+        inner = Image.alpha_composite(inner, ring_glow.filter(ImageFilter.GaussianBlur(radius=2)))
+        inner = Image.alpha_composite(inner, ring_sharp)
+        inner = Image.alpha_composite(inner, ring_core)
+        inner_arr = np.array(inner).astype(np.float32)
+
+        # Outer Composite (2 Layer → 1 Bild, nur 1 Displacement pro Frame)
+        outer = Image.new("RGBA", (rs, rs), (0, 0, 0, 0))
+        outer = Image.alpha_composite(outer, ring_outer_glow.filter(ImageFilter.GaussianBlur(radius=8)))
+        outer = Image.alpha_composite(outer, ring_outer)
+        outer_arr = np.array(outer).astype(np.float32)
+
+        # --- Noise-Texturen ---
+        pad = 100
+        tex_size = rs + pad * 2  # 520
+        noise_tex_x = self._generate_noise_texture(tex_size, seed=42)
+        noise_tex_y = self._generate_noise_texture(tex_size, seed=137)
+        noise_tex_x2 = self._generate_noise_texture(tex_size, seed=73)
+        noise_tex_y2 = self._generate_noise_texture(tex_size, seed=211)
+
+        disp_scale = 15.0
+        disp_scale_outer = 10.0
+        pan_radius = 60
+
+        frames = []
+
+        for fi in range(self.NUM_FRAMES):
+            t = fi / self.NUM_FRAMES * 2 * math.pi
+
+            # Breathing Pulse (2 Pulse pro 3s Loop)
+            breath = 0.85 + 0.15 * math.sin(t * 2)
+
+            # Core-Flash: 3 kurze Blitze pro Loop
+            flash = 0.0
+            for flash_phase in [1.05, 3.14, 5.24]:
+                dist = abs(t - flash_phase)
+                if dist > math.pi:
+                    dist = 2 * math.pi - dist
+                if dist < 0.3:
+                    flash = max(flash, 1.0 - dist / 0.3)
+
+            # --- Inner Displacement ---
+            ox = int(pad + pan_radius * math.cos(t))
+            oy = int(pad + pan_radius * math.sin(t))
+            dx = noise_tex_x[oy:oy+rs, ox:ox+rs] * disp_scale
+
+            ox2 = int(pad + pan_radius * math.cos(2*t + 1.5))
+            oy2 = int(pad + pan_radius * math.sin(t + 0.8))
+            dy = noise_tex_y[oy2:oy2+rs, ox2:ox2+rs] * disp_scale
+
+            # --- Outer Displacement ---
+            oxa = int(pad + pan_radius * 0.7 * math.cos(t * 0.7 + 2.0))
+            oya = int(pad + pan_radius * 0.7 * math.sin(t * 0.7))
+            dx_out = noise_tex_x2[oya:oya+rs, oxa:oxa+rs] * disp_scale_outer
+
+            oxb = int(pad + pan_radius * 0.7 * math.cos(t * 1.3 + 1.0))
+            oyb = int(pad + pan_radius * 0.7 * math.sin(t * 0.9 + 0.5))
+            dy_out = noise_tex_y2[oyb:oyb+rs, oxb:oxb+rs] * disp_scale_outer
+
+            # 2 Displacements (statt 6)
+            disp_inner = self._apply_displacement(inner_arr, dx, dy)
+            disp_outer = self._apply_displacement(outer_arr, dx_out, dy_out)
+
+            # Breathing: Alpha des inneren Composites modulieren
+            if breath < 1.0:
+                disp_inner[:, :, 3] = (disp_inner[:, :, 3].astype(np.float32) * breath).astype(np.uint8)
+
+            # Frame zusammensetzen: Fill-Disc → Electric Rings → Mic
+            frame = Image.new("RGBA", (rs, rs), (0, 0, 0, 0))
+            frame = Image.alpha_composite(frame, fill_disc)  # Gap fuellen
+            frame = Image.alpha_composite(frame, Image.fromarray(disp_outer, mode="RGBA"))
+            frame = Image.alpha_composite(frame, Image.fromarray(disp_inner, mode="RGBA"))
+
+            # Core-Flash: Helligkeit kurz erhoehen
+            if flash > 0:
+                frame_arr = np.array(frame)
+                boost = 1.0 + flash * 0.35
+                frame_arr[:, :, :3] = np.minimum(255,
+                    (frame_arr[:, :, :3].astype(np.float32) * boost)).astype(np.uint8)
+                frame = Image.fromarray(frame_arr, mode="RGBA")
+
+            # Mic-Icon (nicht displaced, bleibt scharf)
+            if self._mic_rgba:
+                mic_rs = self._mic_rgba.size[0]
+                offset = cx - mic_rs // 2
+                frame.paste(self._mic_rgba, (offset, offset), self._mic_rgba)
+
+            frames.append(self._make_display_frame(frame))
+
+        self._frames = frames
+        self._frames_ready = True
+        duration = time.time() - t0
+        append_to_history(
+            f"[STARTUP] Electric Border vorgerendert: {self.NUM_FRAMES} Frames in {duration:.1f}s")
 
     def start(self):
         """Overlay in eigenem Thread starten."""
@@ -316,9 +618,34 @@ class RecordingOverlay:
 
     def _run(self):
         import tkinter as tk
+        from PIL import ImageTk
 
         self.root = tk.Tk()
         self.root.withdraw()
+
+        # Mic-Icon vorrendern
+        self._mic_rgba = self._create_mic_icon()
+        self._t0 = time.time()
+
+        # Statisches Fallback-Frame (nur Mic-Icon mit Fill-Disc, ohne Electric Border)
+        rs = self.RENDER_SIZE
+        cx = rs // 2
+        mic_r = int(self.MIC_DISPLAY / 2 * rs / self.DISPLAY_SIZE)
+        fill_r = mic_r + 30
+        static = Image.new("RGBA", (rs, rs), (0, 0, 0, 0))
+        ImageDraw.Draw(static).ellipse(
+            [cx - fill_r, cx - fill_r, cx + fill_r, cx + fill_r],
+            fill=(185, 38, 38, 255))
+        static = static.filter(ImageFilter.GaussianBlur(radius=6))
+        if self._mic_rgba:
+            mic_rs = self._mic_rgba.size[0]
+            offset = cx - mic_rs // 2
+            static.paste(self._mic_rgba, (offset, offset), self._mic_rgba)
+        self._static_frame = self._make_display_frame(static)
+
+        # Pre-Rendering in separatem Thread starten (laeuft parallel zum Modell-Laden)
+        prerender_thread = threading.Thread(target=self._prerender_frames, daemon=True)
+        prerender_thread.start()
 
         monitors = get_monitors()
 
@@ -326,6 +653,7 @@ class RecordingOverlay:
         WS_EX_TRANSPARENT = 0x20
         WS_EX_LAYERED = 0x80000
 
+        # --- Rote Balken auf allen Monitoren ---
         for i, (left, top, right, bottom) in enumerate(monitors):
             win = tk.Toplevel(self.root)
             title = f"WhisperREC_{i}"
@@ -337,7 +665,7 @@ class RecordingOverlay:
             width = right - left
             win.geometry(f"{width}x{self.BAR_HEIGHT}+{left}+{top}")
 
-            # Click-through: Mausklicks gehen durch den Balken
+            # Click-through
             win.update_idletasks()
             hwnd = user32.FindWindowW(None, title)
             if hwnd:
@@ -347,74 +675,89 @@ class RecordingOverlay:
             win.withdraw()
             self._windows.append(win)
 
-        # Mikrofon-Icon (roter Kreis mit weissem Mikrofon, oben links)
-        from PIL import ImageTk
-        mic_win = tk.Toplevel(self.root)
-        mic_title = "WhisperMIC"
-        mic_win.title(mic_title)
-        mic_win.overrideredirect(True)
-        mic_win.attributes("-topmost", True)
-        trans = "#010101"
-        mic_win.configure(bg=trans)
-        mic_win.attributes("-transparentcolor", trans)
+        # --- Electric Border Fenster (160x160, oben links) ---
+        orb_win = tk.Toplevel(self.root)
+        orb_title = "WhisperORB"
+        orb_win.title(orb_title)
+        orb_win.overrideredirect(True)
+        orb_win.attributes("-topmost", True)
+        trans = "#{:02x}{:02x}{:02x}".format(*self.TRANS_COLOR)
+        orb_win.configure(bg=trans)
+        orb_win.attributes("-transparentcolor", trans)
 
         primary = monitors[0] if monitors else (0, 0, 1920, 1080)
-        mic_x = primary[0] + 20
-        mic_y = primary[1] + self.BAR_HEIGHT + 12
-        mic_win.geometry(f"{self.MIC_SIZE}x{self.MIC_SIZE}+{mic_x}+{mic_y}")
+        orb_x = primary[0] + 12
+        orb_y = primary[1] + self.BAR_HEIGHT + 8
+        orb_win.geometry(f"{self.DISPLAY_SIZE}x{self.DISPLAY_SIZE}+{orb_x}+{orb_y}")
 
-        mic_img = self._create_mic_image()
-        self._mic_photo = ImageTk.PhotoImage(mic_img)
-        label = tk.Label(mic_win, image=self._mic_photo, bg=trans, bd=0,
-                         highlightthickness=0)
-        label.pack()
+        # Initialer leerer Frame
+        init_img = Image.new("RGB", (self.DISPLAY_SIZE, self.DISPLAY_SIZE), self.TRANS_COLOR)
+        self._orb_photo = ImageTk.PhotoImage(init_img)
+        self._orb_label = tk.Label(orb_win, image=self._orb_photo, bg=trans, bd=0,
+                                   highlightthickness=0)
+        self._orb_label.pack()
 
-        mic_win.update_idletasks()
-        hwnd_mic = user32.FindWindowW(None, mic_title)
-        if hwnd_mic:
-            ex_style = user32.GetWindowLongW(hwnd_mic, GWL_EXSTYLE)
-            user32.SetWindowLongW(hwnd_mic, GWL_EXSTYLE,
+        orb_win.update_idletasks()
+        hwnd_orb = user32.FindWindowW(None, orb_title)
+        if hwnd_orb:
+            ex_style = user32.GetWindowLongW(hwnd_orb, GWL_EXSTYLE)
+            user32.SetWindowLongW(hwnd_orb, GWL_EXSTYLE,
                                   ex_style | WS_EX_TRANSPARENT | WS_EX_LAYERED)
 
-        mic_win.withdraw()
-        self._mic_win = mic_win
+        orb_win.withdraw()
+        self._orb_win = orb_win
 
         # Polling: recording-Status alle 100ms pruefen
         self._poll()
         self.root.mainloop()
 
     def _poll(self):
-        """Balken und Mikrofon ein-/ausblenden basierend auf Aufnahme-Status."""
+        """Overlay ein-/ausblenden basierend auf Aufnahme-Status."""
         if recording and not self._visible:
             for win in self._windows:
                 win.deiconify()
-            if self._mic_win:
-                self._mic_win.deiconify()
+            if self._orb_win:
+                self._orb_win.deiconify()
             self._visible = True
-            self._pulse()
+            self._animate()
         elif not recording and self._visible:
             for win in self._windows:
                 win.withdraw()
-            if self._mic_win:
-                self._mic_win.withdraw()
+            if self._orb_win:
+                self._orb_win.withdraw()
             self._visible = False
 
         self.root.after(100, self._poll)
 
-    def _pulse(self):
-        """Sanftes Pulsieren zwischen hellem und dunklerem Rot."""
+    def _animate(self):
+        """Animation: Pre-gerenderte Frames durchcyclen + Balken-Pulse bei ~30 FPS."""
         if not self._visible:
             return
-        # Sinus-Welle fuer sanfte Uebergaenge (Zyklus ~2 Sekunden)
-        factor = (math.sin(time.time() * math.pi) + 1) / 2
-        # Interpolieren: #b91c1c (dunkel) bis #ef4444 (hell)
-        r = int(185 + factor * 54)   # 185-239
-        g = int(28 + factor * 40)    # 28-68
-        b = int(28 + factor * 40)    # 28-68
+
+        from PIL import ImageTk
+
+        # Frame auswaehlen: Calm Mode = immer statisch, sonst Electric Border
+        if calm_mode or not self._frames_ready:
+            frame = self._static_frame
+        else:
+            elapsed = time.time() - self._t0
+            idx = int(elapsed * 30) % self.NUM_FRAMES
+            frame = self._frames[idx]
+
+        self._orb_photo = ImageTk.PhotoImage(frame)
+        self._orb_label.configure(image=self._orb_photo)
+
+        # Balken-Pulse (subtil, ~3s Zyklus)
+        phase = time.time() * 2.0 * math.pi / 3.0
+        factor = (math.sin(phase) + 1) / 2
+        r = int(185 + factor * 54)
+        g = int(28 + factor * 40)
+        b = int(28 + factor * 40)
         color = f"#{r:02x}{g:02x}{b:02x}"
         for win in self._windows:
             win.configure(bg=color)
-        self.root.after(50, self._pulse)
+
+        self.root.after(33, self._animate)  # ~30 FPS
 
 
 def load_model():
@@ -443,12 +786,14 @@ def load_model():
 
 def audio_callback(indata, frames, time_info, status):
     """Wird aufgerufen waehrend der Aufnahme."""
-    global audio_overflow_count
+    global audio_overflow_count, audio_level
     if status:
         # Input overflow = Audio-Daten gingen verloren (Buffer zu klein)
         audio_overflow_count += 1
     if recording:
         audio_chunks.append(indata.copy())
+        # RMS-Pegel fuer Orb-Animation berechnen (0.0-1.0)
+        audio_level = min(1.0, np.sqrt(np.mean(indata**2)) * 5.0)
 
 
 def start_recording():
@@ -480,11 +825,12 @@ def start_recording():
 
 def stop_recording_and_transcribe():
     """Aufnahme stoppen, transkribieren, Text einfuegen."""
-    global recording, stream
+    global recording, stream, audio_level
     if not recording:
         return
 
     recording = False
+    audio_level = 0.0
 
     if stream:
         stream.stop()
@@ -590,18 +936,37 @@ def hotkey_loop():
 
 
 def on_restart(icon, item):
-    """Neustart ueber Tray-Menue: neue Instanz starten, dann aktuelle beenden."""
-    bat_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "whisper-dictate.bat")
-    # Detached cmd.exe wartet 2s (Mutex-Freigabe), startet dann neu
+    """Neustart ueber Tray-Menue: neue Instanz starten, dann aktuelle beenden.
+
+    Verwendet pythonw (nicht cmd.exe) fuer den verzögerten Start,
+    damit kein Terminal-Fenster sichtbar wird.
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    script_path = os.path.join(script_dir, "whisper-dictate.py")
+    pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    # pythonw -c fuer den Sleep: komplett unsichtbar, kein cmd.exe noetig
+    restart_code = (
+        "import time,subprocess;"
+        f"time.sleep(2);"
+        f"subprocess.Popen([r'{pythonw}',r'{script_path}'],cwd=r'{script_dir}')"
+    )
     CREATE_NEW_PROCESS_GROUP = 0x00000200
     DETACHED_PROCESS = 0x00000008
+    CREATE_NO_WINDOW = 0x08000000
     subprocess.Popen(
-        f'cmd.exe /c "timeout /t 2 /nobreak >nul && start "" "{bat_path}""',
-        creationflags=CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS,
+        [pythonw, "-c", restart_code],
+        creationflags=CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW,
         close_fds=True,
     )
     icon.stop()
     os._exit(0)
+
+
+def on_toggle_calm(icon, item):
+    """Calm Mode umschalten (statisches Mic-Icon statt Electric Border)."""
+    global calm_mode
+    calm_mode = not calm_mode
+    save_config()
 
 
 def on_quit(icon, item):
@@ -613,11 +978,19 @@ def on_quit(icon, item):
 def main():
     global tray_icon
 
+    # Autostart sicherstellen (Registry Run-Key setzen, alte .lnk aufraeumen)
+    ensure_autostart()
+
+    # Config laden (calm_mode etc.)
+    load_config()
+
     # Tray-Icon erstellen
     menu = pystray.Menu(
-        pystray.MenuItem("Neustart", on_restart),
+        pystray.MenuItem("Calm Overlay", on_toggle_calm, checked=lambda item: calm_mode),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Beenden", on_quit),
+        pystray.MenuItem("Restart", on_restart),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Off", on_quit),
     )
     tray_icon = pystray.Icon(
         "whisper-dictate",
