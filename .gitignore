@@ -5,10 +5,6 @@ whisper-history.log
 # Runtime config (auto-created)
 whisper-config.json
 
-# Preview
-mic-icon-preview.png
-nul
-
 # Python
 __pycache__/
 *.pyc
